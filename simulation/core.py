@@ -1,11 +1,9 @@
-"""Market microstructure simulation — Phase 1, 2 & 3 core."""
+"""Market microstructure simulation"""
 
 from __future__ import annotations
 import bisect
 import heapq
-from collections import deque
 from dataclasses import dataclass, field
-from typing import ClassVar
 import numpy as np
 
 from .events import (
@@ -15,10 +13,6 @@ from .events import (
 )
 from .agents import MarketMaker, Sniper, Investor
 
-
-# ---------------------------------------------------------------------------
-# Section 1: Parameters
-# ---------------------------------------------------------------------------
 
 @dataclass
 class SimulationParams:
@@ -34,7 +28,7 @@ class SimulationParams:
     mm_lag: float = 0.010
     # --- Market Maker (Phase 2) ---
     mm_base_spread_ticks: int = 4
-    mm_max_inventory: float = 300.0
+    mm_max_inventory: float = 100.0
     mm_inventory_skew_factor: float = 0.1
     mm_divergence_threshold_ticks: int = 2
     mm_refill_on_fill: bool = True
@@ -67,9 +61,6 @@ class SimulationParams:
         self.T = self.trading_hours * 3600
 
 
-# ---------------------------------------------------------------------------
-# Section 1: Y Process
-# ---------------------------------------------------------------------------
 
 def simulate_Y(params: SimulationParams):
     """Jump diffusion: BM (smooth long-horizon trend) + Poisson jumps (discrete short-horizon steps)."""
@@ -94,37 +85,6 @@ def simulate_Y(params: SimulationParams):
 
 
 
-class SimpleMarketMaker:
-
-    def __init__(self, params: SimulationParams):
-        self.params = params
-        self.bid = None
-        self.ask = None
-
-    def observe_Y(self, y_value: float, observed_at_time: float):
-        half_spread = self.params.mm_base_spread_ticks * self.params.tick_size / 2
-        self.bid = y_value - half_spread
-        self.ask = y_value + half_spread
-
-    def get_quotes(self):
-        return (self.bid, self.ask)
-
-
-def simulate_MM_quotes(params: SimulationParams, times: np.ndarray, prices: np.ndarray):
-    """Build MM quote time series: sparse arrays shifted by mm_lag."""
-    mm = SimpleMarketMaker(params)
-    quote_times = times + params.mm_lag
-    bids = np.empty(len(times))
-    asks = np.empty(len(times))
-    for i, (t, y) in enumerate(zip(times, prices)):
-        mm.observe_Y(y, t + params.mm_lag)
-        bids[i], asks[i] = mm.get_quotes()
-    return quote_times, bids, asks
-
-
-# ---------------------------------------------------------------------------
-# Section 2: Central Order Book
-# ---------------------------------------------------------------------------
 
 @dataclass
 class Order:
@@ -283,6 +243,7 @@ class SimulationRunner:
 
     def build_event_queue(self, y_times: np.ndarray,
                           y_prices: np.ndarray) -> list[BaseEvent]:
+        """Generate all events (Y jumps, sniper observes, MM observes, investor arrivals) and sort by time. Using heap for efficient event processing."""
         events: list[BaseEvent] = []
         for t, y in zip(y_times[1:], y_prices[1:]):
             events.append(YJumpEvent(time=float(t), y_value=float(y)))
@@ -302,32 +263,18 @@ class SimulationRunner:
                 break
             events.append(InvestorArriveEvent(time=t))
 
-        events.sort(key=lambda e: (e.time, e.PRIORITY))
+        # Randomize order of simultaneous sniper events
+        events.sort(key=lambda e: (
+            e.time,
+            e.PRIORITY,
+            int(self.rng.integers(0, 2**31)) if isinstance(e, SniperObserveEvent) else 0,
+        ))
 
-        result: list[BaseEvent] = []
-        i = 0
-        while i < len(events):
-            j = i
-            while j < len(events) and events[j].time == events[i].time:
-                j += 1
-            group = events[i:j]
-            sn = [e for e in group if isinstance(e, SniperObserveEvent)]
-            if len(sn) > 1:
-                self.rng.shuffle(sn)
-                sn_iter = iter(sn)
-                result.extend(
-                    next(sn_iter) if isinstance(e, SniperObserveEvent) else e
-                    for e in group
-                )
-            else:
-                result.extend(group)
-            i = j
-
-        for i, e in enumerate(result):
+        for i, e in enumerate(events):
             e._seq = i
-        self._seq_counter = len(result)
-        heapq.heapify(result)
-        return result
+        self._seq_counter = len(events)
+        heapq.heapify(events) #sorts events, it guarantees earliest that event is first
+        return events
 
     def run(self) -> SimulationResult:
         y_times, y_prices = simulate_Y(self.params)
