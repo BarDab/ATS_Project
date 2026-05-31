@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 import bisect
-import csv
 import heapq
-import json
-import os
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import ClassVar
 import numpy as np
+
+from .events import (
+    EventLogger,
+    BaseEvent, YJumpEvent, SniperObserveEvent, MMObserveEvent,
+    InvestorArriveEvent, DeferredLabelEvent,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -29,27 +31,24 @@ class SimulationParams:
     sigma: float = 0.05
     # --- Phase 1 quote tracking ---
     mm_lag: float = 0.010
-    mm_spread_ticks: int = 4
     # --- Market Maker (Phase 2) ---
     mm_base_spread_ticks: int = 4
-    mm_max_inventory: float = 10.0
+    mm_max_inventory: float = 300.0
     mm_inventory_skew_factor: float = 0.1
-    mm_pull_mode: str = "exposed"
     mm_divergence_threshold_ticks: int = 2
     mm_refill_on_fill: bool = True
     # --- Snipers ---
     sniper_lag: float = 0.001
-    sniper_min_edge_ticks: int = 2
     sniper_order_size: int = 1
     n_snipers: int = 2
+    sniper_min_edge_ticks: int = 2 # this is currently used for both labeling and sniper logic, just to keep it simple, but can be separated if needed
     # --- Investors ---
     investor_arrival_rate: float = 1.0
     investor_order_size: int = 1
     # --- Informed Trade Detection (Phase 3) ---
     mm_detection_window: float = 0.1
-    mm_labeling_threshold_ticks: int = 1
     mm_window_size: int = 50
-    mm_min_fills_for_adjustment: int = 10
+    mm_min_fills_for_adjustment: int = 10 # before adjusting alpha for calculating MM spread, we need minimal fills to have somewhat stable estimation
     # --- Spread Adjustment (Phase 3) ---
     mm_alpha_sensitivity: float = 2.0
     mm_spread_floor_ticks: int = 2
@@ -57,6 +56,7 @@ class SimulationParams:
     # --- Logging ---
     enable_logging: bool = False
     log_dir: str = "logs"
+    run_label: str = ""
 
     lambda_jump: float = field(init=False)
     T: float = field(init=False)
@@ -67,7 +67,7 @@ class SimulationParams:
 
 
 # ---------------------------------------------------------------------------
-# Section 2: Y Process
+# Section 1: Y Process
 # ---------------------------------------------------------------------------
 
 def simulate_Y(params: SimulationParams):
@@ -93,7 +93,7 @@ def simulate_Y(params: SimulationParams):
 
 
 # ---------------------------------------------------------------------------
-# Section 3: Simple Market Maker (Phase 1 quote tracker)
+# Section 1b: Simple Market Maker + Quote Time Series (Phase 1)
 # ---------------------------------------------------------------------------
 
 class SimpleMarketMaker:
@@ -102,21 +102,15 @@ class SimpleMarketMaker:
         self.params = params
         self.bid = None
         self.ask = None
-        self._last_observed_at = None
 
     def observe_Y(self, y_value: float, observed_at_time: float):
-        half_spread = self.params.mm_spread_ticks * self.params.tick_size / 2
+        half_spread = self.params.mm_base_spread_ticks * self.params.tick_size / 2
         self.bid = y_value - half_spread
         self.ask = y_value + half_spread
-        self._last_observed_at = observed_at_time
 
     def get_quotes(self):
         return (self.bid, self.ask)
 
-
-# ---------------------------------------------------------------------------
-# Section 4: MM Quote Time Series (Phase 1)
-# ---------------------------------------------------------------------------
 
 def simulate_MM_quotes(params: SimulationParams, times: np.ndarray, prices: np.ndarray):
     """Build MM quote time series: sparse arrays shifted by mm_lag."""
@@ -131,7 +125,7 @@ def simulate_MM_quotes(params: SimulationParams, times: np.ndarray, prices: np.n
 
 
 # ---------------------------------------------------------------------------
-# Section 6: Central Order Book
+# Section 2: Central Order Book
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -243,9 +237,17 @@ class MarketMaker:
         self.spread_history: list[dict] = []
         self.pnl_decomposition_history: list[dict] = []
 
+    def _get_market_mid_price(self) -> float | None:
+        # get current ask/bid from order book or last know bid/ask price
+        bid = self.book.get_best_bid() if self.book.bids else self._last_bid_price
+        ask = self.book.get_best_ask() if self.book.asks else self._last_ask_price
+        if bid is not None and ask is not None:
+            return (bid + ask) / 2
+        return None
+
     def _snap(self, price: float) -> float:
-        ts = self.params.tick_size
-        return round(price / ts) * ts
+        tick_size = self.params.tick_size
+        return round(price / tick_size) * tick_size
 
     def _cancel_bid(self):
         if self.current_bid_id:
@@ -285,30 +287,53 @@ class MarketMaker:
                if current_book_mid is not None else 0.0)
 
         if div > self.params.mm_divergence_threshold_ticks:
-            mode = self.params.mm_pull_mode
-            if mode == "both":
-                self._cancel_both()
-                self._post_bid(skewed_mid, wide_half, observed_at_time)
-                self._post_ask(skewed_mid, wide_half, observed_at_time)
-            elif mode == "exposed":
-                if current_book_mid is not None and y_value > current_book_mid:
-                    self._cancel_ask()
-                    self._post_ask(skewed_mid, wide_half, observed_at_time)
-                else:
-                    self._cancel_bid()
-                    self._post_bid(skewed_mid, wide_half, observed_at_time)
-            # "skew": do nothing now
+            self._cancel_both()
+            self._post_bid(skewed_mid, wide_half, observed_at_time)
+            self._post_ask(skewed_mid, wide_half, observed_at_time)
+
         else:
             self._cancel_both()
             self._post_bid(skewed_mid, normal_half, observed_at_time)
             self._post_ask(skewed_mid, normal_half, observed_at_time)
 
     def on_fill(self, fill_id: str | None, side: str, fill_price: float,
-                fill_quantity: int, timestamp: float, current_Y: float):
+                fill_quantity: int, timestamp: float):
+        
+        # update inventory
         prev_inv = self.inventory
         delta = fill_quantity if side == "bid" else -fill_quantity
         new_inv = prev_inv + delta
+        self.inventory = new_inv
+        mid_price = self._get_market_mid_price()
 
+        self._calculate_pnl_and_entry_price(prev_inv, new_inv, fill_price, fill_quantity, side)
+
+        # update unrealized pnl
+        
+        if mid_price is not None:
+            self.unrealized_pnl = (self.inventory * (mid_price - self.avg_entry_price)
+                                   if self.inventory != 0 else 0.0)
+
+        self._clear_current_order_id(side)
+
+
+        if fill_id is not None:
+            self.pending_fills[fill_id] = {
+                "side": side,
+                "fill_price": fill_price,
+                "fill_time": timestamp,
+                "fill_quantity": fill_quantity,
+            }
+        
+        self._submit_new_order_after_fill(timestamp)
+
+    def _clear_current_order_id(self, side: str):
+        if side == "bid":
+            self.current_bid_id = None
+        else:
+            self.current_ask_id = None
+
+    def _calculate_pnl_and_entry_price(self, prev_inv: float, new_inv: float, fill_price: float, fill_quantity: int, side: str):
         if prev_inv == 0.0:
             self.avg_entry_price = fill_price
         elif (abs(new_inv) > abs(prev_inv) and
@@ -325,28 +350,8 @@ class MarketMaker:
             if new_inv != 0 and ((prev_inv > 0) != (new_inv > 0)):
                 self.avg_entry_price = fill_price
 
-        self.inventory = new_inv
-        self.unrealized_pnl = (self.inventory * (current_Y - self.avg_entry_price)
-                               if self.inventory != 0 else 0.0)
-
-        if side == "ask":
-            self.current_ask_id = None
-        else:
-            self.current_bid_id = None
-
-        if fill_id is not None:
-            self.pending_fills[fill_id] = {
-                "side": side,
-                "Y_at_fill": current_Y,
-                "fill_price": fill_price,
-                "fill_time": timestamp,
-                "fill_quantity": fill_quantity,
-            }
-
-        if self.params.mm_refill_on_fill:
-            self.refill_on_fill(timestamp)
                     
-    def refill_on_fill(self, timestamp: float):
+    def _submit_new_order_after_fill(self, timestamp: float):
         if self.params.mm_refill_on_fill:
             if self.current_bid_id is None and self._last_bid_price is not None:
                 if self.inventory < self.params.mm_max_inventory:
@@ -357,16 +362,18 @@ class MarketMaker:
                     self.current_ask_id = self.book.submit_limit(
                         "mm", "ask", self._last_ask_price, 1, timestamp)
 
-    def mark_to_market(self, current_Y: float):
-        self.unrealized_pnl = (self.inventory * (current_Y - self.avg_entry_price)
-                               if self.inventory != 0 else 0.0)
+    def mark_to_market(self):
+        """Just update unrealized PnL based on current mid price."""
+        mid_price = self._get_market_mid_price()
+        if mid_price is not None:
+            self.unrealized_pnl = (self.inventory * (mid_price - self.avg_entry_price)
+                                   if self.inventory != 0 else 0.0)
 
     def _is_informed(self, fill: dict, Y_now: float) -> bool:
-        y_move = Y_now - fill["Y_at_fill"]
-        threshold = self.params.mm_labeling_threshold_ticks * self.params.tick_size
+        threshold = self.params.sniper_min_edge_ticks * self.params.tick_size
         if fill["side"] == "ask":
-            return y_move > threshold
-        return y_move < -threshold
+            return Y_now > fill["fill_price"] + threshold
+        return Y_now < fill["fill_price"] - threshold
 
     def _update_alpha_and_spread(self, informed: bool, timestamp: float):
         self.fill_history.append(informed)
@@ -375,7 +382,7 @@ class MarketMaker:
         self.current_spread_ticks = self._compute_spread()
         self.spread_history.append({"time": timestamp, "spread_ticks": self.current_spread_ticks})
 
-    def _attribute_pnl(self, fill: dict, informed: bool, Y_now: float, timestamp: float):
+    def _classify_pnl(self, fill: dict, informed: bool, Y_now: float, timestamp: float):
         half_spread = fill["fill_quantity"] * self.current_spread_ticks * self.params.tick_size / 2
         if informed:
             if fill["side"] == "ask":
@@ -392,15 +399,21 @@ class MarketMaker:
             "total_attributed_pnl": self.spread_income + self.adverse_selection_loss,
         })
 
-    def resolve_deferred_fill(self, fill_id: str, Y_now: float, timestamp: float):
+    def get_information_from_processed_trade(self, fill_id: str, Y_now: float, timestamp: float):
+        """"This is updating information which are available to MM after certain delay. Returning True if trade classified as informed else False"""
         if fill_id not in self.pending_fills:
             return
         fill = self.pending_fills.pop(fill_id)
         informed = self._is_informed(fill, Y_now)
         self._update_alpha_and_spread(informed, timestamp)
-        self._attribute_pnl(fill, informed, Y_now, timestamp)
+        self._classify_pnl(fill, informed, Y_now, timestamp)
+        return informed
 
+    # TOOD verify if this can be be adjusted to Glosten-Milgrom
     def _compute_spread(self) -> float:
+        """"Ideally this method should compute spread based on Glosten-Milgrom model"""
+
+        # when there is not enough data to have stable alpha estimation, use base spread, otherwise adjust based on alpha and clamp to floor/ceiling
         if len(self.fill_history) < self.params.mm_min_fills_for_adjustment:
             return self.params.mm_base_spread_ticks
         adjusted = self.params.mm_base_spread_ticks * (1 + self.params.mm_alpha_sensitivity * self.alpha)
@@ -440,9 +453,9 @@ class Sniper:
         self.realized_pnl: float = 0.0
         self.trades_executed: int = 0
 
-    def observe_Y(self, y_value: float, observed_at_time: float):
-        ts = self.params.tick_size
-        edge = self.params.sniper_min_edge_ticks * ts
+    def snipe(self, y_value: float, observed_at_time: float):
+        tick_size = self.params.tick_size
+        edge = self.params.sniper_min_edge_ticks * tick_size
 
         best_ask = self.book.get_best_ask()
         if best_ask is not None and (y_value - best_ask) > edge:
@@ -453,7 +466,7 @@ class Sniper:
                 if self._mm_fill_cb and f["matched_agent_id"] == "mm":
                     self._mm_fill_cb("ask", f["price"], f["quantity"],
                                      observed_at_time, y_value,
-                                     f["matched_order_id"])
+                                     f["matched_order_id"], self.agent_id)
 
         best_bid = self.book.get_best_bid()
         if best_bid is not None and (best_bid - y_value) > edge:
@@ -464,10 +477,11 @@ class Sniper:
                 if self._mm_fill_cb and f["matched_agent_id"] == "mm":
                     self._mm_fill_cb("bid", f["price"], f["quantity"],
                                      observed_at_time, y_value,
-                                     f["matched_order_id"])
+                                     f["matched_order_id"], self.agent_id)
 
     def on_fill(self, fill_price: float, fill_quantity: int,
                 side: str, current_Y: float):
+        # Not real PNL just assesment, TODO remove this part
         if side == "bid":
             self.realized_pnl += fill_quantity * (current_Y - fill_price)
         else:
@@ -499,136 +513,7 @@ class Investor:
             if self._mm_fill_cb and f["matched_agent_id"] == "mm":
                 mm_side = "ask" if side == "bid" else "bid"
                 self._mm_fill_cb(mm_side, f["price"], f["quantity"], timestamp,
-                                 None, f["matched_order_id"])
-
-
-# ---------------------------------------------------------------------------
-# Section 11: Event Logger
-# ---------------------------------------------------------------------------
-
-_LOG_FIELDS = [
-    "timestamp", "event_type", "agent_id", "order_id", "side",
-    "price", "quantity", "fill_price", "fill_quantity",
-    "matched_order_id", "matched_agent_id",
-    "book_bid", "book_ask", "Y_value",
-    "mm_inventory", "mm_realized_pnl", "mm_unrealized_pnl",
-    "alpha", "current_spread_ticks", "spread_income", "adverse_selection_loss",
-]
-
-
-class EventLogger:
-
-    def __init__(self, params: SimulationParams):
-        self.enabled = params.enable_logging
-        self._csv_file = None
-        self._writer = None
-        self._csv_path: str | None = None
-        self._json_path: str | None = None
-
-        if self.enabled:
-            os.makedirs(params.log_dir, exist_ok=True)
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self._csv_path = os.path.join(params.log_dir, f"events_{stamp}.csv")
-            self._json_path = os.path.join(params.log_dir, f"summary_{stamp}.json")
-            self._csv_file = open(self._csv_path, "w", newline="")
-            self._writer = csv.DictWriter(self._csv_file, fieldnames=_LOG_FIELDS,
-                                          extrasaction="ignore")
-            self._writer.writeheader()
-
-    def log_event(self, timestamp, event_type, agent_id, **kwargs):
-        if not self.enabled:
-            return
-        row = {"timestamp": timestamp, "event_type": event_type,
-               "agent_id": agent_id}
-        row.update(kwargs)
-        self._writer.writerow(row)
-
-    def write_summary(self, result: "SimulationResult", params: SimulationParams):
-        if not self.enabled or self._json_path is None:
-            return
-        import dataclasses
-        params_dict = dataclasses.asdict(params)
-        params_dict["target_jumps_per_day"] = params.target_jumps_per_day
-        params_dict["jump_size_probs"] = list(params.jump_size_probs)
-        mm_snap = result.mm_pnl_history[-1] if result.mm_pnl_history else {}
-        summary = {
-            "params": params_dict,
-            "total_trades": (result.sniper1_trades + result.sniper2_trades
-                             + result.investor_trades),
-            "mm_final_realized_pnl": mm_snap.get("realized_pnl", 0.0),
-            "mm_final_unrealized_pnl": mm_snap.get("unrealized_pnl", 0.0),
-            "mm_final_total_pnl": mm_snap.get("total_pnl", 0.0),
-            "mm_final_inventory": mm_snap.get("inventory", 0.0),
-            "sniper1_pnl": result.sniper1_pnl,
-            "sniper2_pnl": result.sniper2_pnl,
-            "sniper1_trades": result.sniper1_trades,
-            "sniper2_trades": result.sniper2_trades,
-            "investor_trades": result.investor_trades,
-            "avg_spread": result.avg_spread,
-            "simulation_duration_seconds": params.T,
-            "mm_final_alpha": result.mm_final_alpha,
-            "mm_final_spread_ticks": result.mm_final_spread_ticks,
-            "mm_spread_income": mm_snap.get("spread_income", 0.0),
-            "mm_adverse_selection_loss": mm_snap.get("adverse_selection_loss", 0.0),
-            "mm_total_attributed_pnl": mm_snap.get("total_attributed_pnl", 0.0),
-            "mm_n_fills_labeled": mm_snap.get("n_fills_labeled", 0),
-            "mm_n_pending_fills_at_end": mm_snap.get("n_pending_fills", 0),
-        }
-        with open(self._json_path, "w") as fh:
-            json.dump(summary, fh, indent=2)
-
-    def close(self):
-        if self._csv_file:
-            self._csv_file.close()
-            self._csv_file = None
-
-
-# ---------------------------------------------------------------------------
-# Section 10: Events, SimulationResult, SimulationRunner
-# ---------------------------------------------------------------------------
-
-@dataclass
-class BaseEvent:
-    time: float
-    _seq: int = field(default=0)
-    PRIORITY: ClassVar[int] = 99
-
-    def __lt__(self, other: "BaseEvent") -> bool:
-        if self.time != other.time:
-            return self.time < other.time
-        if self.PRIORITY != other.PRIORITY:
-            return self.PRIORITY < other.PRIORITY
-        return self._seq < other._seq
-
-
-@dataclass
-class YJumpEvent(BaseEvent):
-    PRIORITY: ClassVar[int] = 0
-    y_value: float = 0.0
-
-
-@dataclass
-class SniperObserveEvent(BaseEvent):
-    PRIORITY: ClassVar[int] = 1
-    agent_id: str = ""
-    y_value: float = 0.0
-
-
-@dataclass
-class MMObserveEvent(BaseEvent):
-    PRIORITY: ClassVar[int] = 2
-    y_value: float = 0.0
-
-
-@dataclass
-class InvestorArriveEvent(BaseEvent):
-    PRIORITY: ClassVar[int] = 3
-
-
-@dataclass
-class DeferredLabelEvent(BaseEvent):
-    PRIORITY: ClassVar[int] = 4
-    fill_id: str = ""
+                                 None, f["matched_order_id"], "inv")
 
 
 @dataclass
@@ -671,11 +556,33 @@ class SimulationRunner:
         self._event_queue: list | None = None
         self._seq_counter: int = 0
 
+    def _mm_state(self) -> dict:
+        bid = self.book.get_best_bid()
+        ask = self.book.get_best_ask()
+        spread = round(ask - bid, 4) if bid is not None and ask is not None else None
+        return {
+            "book_bid": bid,
+            "book_ask": ask,
+            "book_spread": spread,
+            "mm_inventory": self.mm.inventory,
+            "mm_realized_pnl": self.mm.realized_pnl,
+            "mm_unrealized_pnl": self.mm.unrealized_pnl,
+            "alpha": self.mm.alpha,
+            "current_spread_ticks": self.mm.current_spread_ticks,
+            "spread_income": self.mm.spread_income,
+            "adverse_selection_loss": self.mm.adverse_selection_loss,
+        }
+
     def _route_mm_fill(self, side: str, fill_price: float, fill_quantity: int,
                        timestamp: float, current_Y: float | None,
-                       fill_id: str | None = None):
-        actual_Y = current_Y if current_Y is not None else self._current_Y
-        self.mm.on_fill(fill_id, side, fill_price, fill_quantity, timestamp, actual_Y)
+                       fill_id: str | None = None, taker_agent_id: str | None = None):
+        self.mm.on_fill(fill_id, side, fill_price, fill_quantity, timestamp)
+        self.logger.log_event(timestamp, "MM_FILL", "mm",
+                              order_id=fill_id, side=side,
+                              fill_price=fill_price, fill_quantity=fill_quantity,
+                              taker_agent_id=taker_agent_id,
+                              Y_value=self._current_Y,
+                              **self._mm_state())
         if fill_id is not None and self._event_queue is not None:
             label_time = timestamp + self.params.mm_detection_window
             if label_time <= self.params.T:
@@ -742,10 +649,12 @@ class SimulationRunner:
         while self._event_queue:
             event = heapq.heappop(self._event_queue)
             total_event_count += 1
+            
             match event:
+                # jumpt event -> 
                 case YJumpEvent(y_value=y):
                     self._current_Y = y
-                    self.mm.mark_to_market(self._current_Y)
+                    self.mm.mark_to_market()
                     spread = self.book.get_spread()
                     if spread is not None:
                         spread_samples.append(spread)
@@ -753,21 +662,30 @@ class SimulationRunner:
                                            **self.mm.get_pnl_snapshot()})
                     self.logger.log_event(event.time, "Y_JUMP", "market",
                                           Y_value=self._current_Y,
-                                          book_bid=self.book.get_best_bid(),
-                                          book_ask=self.book.get_best_ask(),
-                                          mm_inventory=self.mm.inventory,
-                                          mm_realized_pnl=self.mm.realized_pnl,
-                                          mm_unrealized_pnl=self.mm.unrealized_pnl)
+                                          **self._mm_state())
                 case SniperObserveEvent(agent_id=aid, y_value=y):
                     sniper = self._sniper_map.get(aid)
                     if sniper:
-                        sniper.observe_Y(y, event.time)
+                        sniper.snipe(y, event.time)
+                        self.logger.log_event(event.time, "SNIPER_OBSERVE", aid,
+                                              Y_value=y, **self._mm_state())
                 case MMObserveEvent(y_value=y):
                     self.mm.react_to_divergence(y, event.time, self.book.get_midpoint())
+                    self.logger.log_event(event.time, "MM_OBSERVE", "mm",
+                                          Y_value=y, **self._mm_state())
                 case InvestorArriveEvent():
                     self.investor.arrive(event.time)
+                    self.logger.log_event(event.time, "INVESTOR_ARRIVE", "inv",
+                                          **self._mm_state())
                 case DeferredLabelEvent(fill_id=fid):
-                    self.mm.resolve_deferred_fill(fill_id=fid, Y_now=self._current_Y, timestamp=event.time)
+                    informed = self.mm.get_information_from_processed_trade(
+                        fill_id=fid, Y_now=self._current_Y, timestamp=event.time)
+                    if informed is not None:
+                        self.logger.log_event(event.time, "DEFERRED_LABEL", "mm",
+                                              order_id=fid,
+                                              Y_value=self._current_Y,
+                                              informed=informed,
+                                              **self._mm_state())
 
         result = SimulationResult(
             mm_pnl_history=mm_pnl_history,
