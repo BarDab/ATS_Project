@@ -3,79 +3,137 @@
 Market microstructure simulation based on **Budish, Cramton & Shim (2015)**.
 Models a continuous limit order book where a market maker posts two-sided quotes,
 snipers exploit the lag between price moves and MM quote updates, and investors
-arrive randomly. The central question: how much does sniper presence hurt the MM,
-and how does it affect spread and liquidity?
+arrive randomly.
 
-See `PROJECT_CONTEXT.md` for full documentation, findings, and next steps.
+See `PROJECT_CONTEXT.md` for full parameter reference, findings, and next steps.
 
 ---
 
-## Model Logic
+## How This Simulation Works
+
+The simulation is **event-driven**: every action that any agent can take is represented
+as an event with a timestamp, and a central loop processes them in chronological order.
+
+### Pre-generated events
+
+Before the simulation starts, three types of events are built upfront and sorted by
+timestamp — these represent scheduled observations rather than decisions:
+
+- **Y_JUMP** — the true asset price moves. Fires at every jump of the price process.
+  No agent acts yet; this just updates the ground truth.
+- **SNIPER_OBSERVE** — each sniper gets to look at the current price, 1ms after the
+  corresponding jump. If quotes are stale enough to be profitable, a sniper may act.
+- **MM_OBSERVE** — the market maker gets to look at the current price, 10ms after the
+  jump. It then cancels and reposts its quotes. Always fires after the snipers for the
+  same jump, which is the core mechanism of the arms race.
+
+Investor arrivals are also pre-generated as a Poisson stream and interleaved into the
+same sorted list.
+
+When two snipers react to the same jump they land at the exact same timestamp. To avoid
+giving either a systematic advantage, their order is randomised before the simulation
+runs.
+
+### The event loop
+
+`SimulationRunner.run()` processes generated events one by one from the queue and dispatches to the
+relevant agent:
+
+```
+Y_JUMP            → update current price, sample spread, record MM PnL snapshot
+SNIPER_OBSERVE    → sniper checks for stale quotes and hits them if profitable
+MM_OBSERVE        → MM cancels stale quotes and reposts at current fair value
+INVESTOR_ARRIVE   → investor submits a random-direction market order
+DEFERRED_LABEL    → fires 100ms after a MM fill; classifies it as informed or not
+```
+
+`DEFERRED_LABEL` events are the only ones created *during* the simulation (pushed onto
+the heap when a fill occurs). Everything else is known before the first tick. The 100ms delay on `DEFERRED_LABEL` is intentional: at the moment a fill happens the MM cannot yet know whether it was informed or not — Y may still move further in the same direction, or may reverse. Waiting 100ms gives the price time to reveal its
+post-fill direction, so the classification (did Y move away from the fill price by
+more than `min_edge` ticks?) reflects what actually happened rather than a noisy
+snapshot taken mid-jump. In a real market this corresponds to the time a dealer needs
+to observe post-trade price impact before deciding whether the counterparty had
+private information.
+
+---
+
+## Agents
+
+### Market Maker
+
+The MM acts as a passive liquidity provider: it continuously quotes a **bid and an ask**
+around its observation of the fair value Y, earning the spread on uninformed flow while
+absorbing adverse selection from snipers.
+
+**Quoting**: at each `MM_OBSERVE`, the MM posts a bid below and an ask above its
+(lagged) view of Y. It uses a single spread width that it adjusts dynamically over time.
+If the current book midpoint has drifted more than a threshold from Y (stale quotes),
+it reposts wider to compensate for the increased risk.
+
+**Inventory**: the MM accumulates inventory as it fills orders. It skews its quoted
+midpoint away from the direction it is long to encourage mean-reverting flow — long
+positions push the mid down, short positions push it up. For simplicity there is no
+hard inventory target or active hedging; the skew is the only inventory management.
+
+**Dynamic spread**:  the MM tracks which of its recent fills came from
+informed traders (snipers) versus uninformed ones (investors). It estimates **alpha**
+— the fraction of informed fills over the last 50 trades — and widens its spread when
+alpha is high:
+
+```
+spread = base_spread × (1 + alpha_sensitivity × alpha)
+```
+
+The spread is clamped between a floor and a ceiling. This means the MM
+responds to a high-sniper environment by charging more, partially offsetting
+the adverse selection loss.
+
+**PnL decomposition**: realized PnL is split into `spread_income` (earned on
+uninformed fills) and `adverse_selection_loss` (mark-to-market loss on informed fills).
+
+### Snipers
+
+Two snipers observe Y with a 1ms lag — faster than the MM's 10ms lag. After each
+price jump, each sniper checks whether any MM quote is mispriced enough to be worth
+hitting. If `Y − best_ask > min_edge`, the sniper submits a market buy; symmetrically
+for the ask side.
+
+The 9ms window between sniper observation (t+1ms) and MM observation (t+10ms) is
+where sniping happens. Snipers never hold inventory — they value every fill
+immediately at the current Y (we don't care much about their profit in this project, so it's just a mock).
+
+### Investors
+
+Investors represent uninformed, exogenous demand. They arrive via a Poisson process
+(1 per second by default) and submit a random-direction market order of size 1. They
+do not optimise their timing or price — they just need to trade. Same as Snipers they are submitting market orders only.
+
+---
+
+## Random Processes
 
 ### Price process (Y)
 
-The "true value" of the asset follows a **jump-diffusion** process — a combination of
-continuous Brownian motion and discrete Poisson jumps, both applied at each jump event
-and snapped to the tick grid:
+The true asset value follows a **jump-diffusion**: at each event, both a Brownian
+motion increment and a discrete jump are applied, then the result is snapped to the
+tick grid:
 
 ```
 y += σ·√dt·Z  +  direction × n_ticks × tick_size
 y  = round(y / tick_size) * tick_size
 ```
 
-The BM component produces smooth trending at long horizons (full-day chart looks like
-a real price path). The jump component produces the discrete steps visible at
-millisecond resolution. Jump size is drawn independently each time from
-`[1, 2, 3, 4]` ticks with probabilities `[0.70, 0.20, 0.07, 0.03]`.
+Jump times are drawn from an exponential distribution targeting 100,000 jumps per
+8-hour day. Jump size is drawn from `[1, 2, 3, 4]` ticks with probabilities
+`[0.70, 0.20, 0.07, 0.03]`. The BM component produces smooth drift visible at long
+time horizons; the jump component produces the discrete steps visible at millisecond
+resolution. We tried to model this process with sole Poisson - while it look as expected in high frequency periods it looked like white noise on lower frequencies. 
 
-### Agents
+### Investor arrivals
 
-**Market Maker** — observes Y with a 10ms lag, posts bid and ask around the
-observed price. When the book midpoint has drifted from Y by more than a threshold
-(stale quotes), the MM pulls the exposed side and reposts wider. When at inventory
-limits, the corresponding side is not posted.
-
-**Snipers (×2)** — observe Y with a 1ms lag, faster than the MM. If Y has moved
-enough that an MM quote is mispriced by more than `sniper_min_edge_ticks`, the sniper
-submits a market order to take it. Both snipers react to the same jump simultaneously;
-their order of execution is randomised to avoid systematic advantage.
-
-**Investors** — arrive via a Poisson process (1/sec by default), submit a random-direction
-market order of size 1. They represent uninformed flow.
-
-### Event queue
-
-The simulation is discrete-event. For each Y jump at time `t`:
-
-```
-t + 0.000s   Y_JUMP          mark-to-market, sample spread
-t + 0.001s   SNIPER_OBSERVE  snipers check for stale quotes (order randomised)
-t + 0.010s   MM_OBSERVE      MM cancels/reposts quotes
-```
-
-The window **[t+1ms, t+10ms]** is where the arms race happens: snipers can hit
-stale MM quotes before the MM has a chance to update them.
-
----
-
-## Key Assumptions
-
-- **Single asset, single MM.** No competition between market makers.
-- **MM has no alpha.** It only reacts to Y; it cannot predict where Y is going.
-- **Snipers are pure arbitrageurs.** They trade only when there is a calculable edge,
-  hold no inventory, and mark profits immediately to the current Y.
-- **Investors are noise traders.** Random direction, fixed size, no price sensitivity.
-  They will fill against whatever is in the book, or not fill at all if the book is empty.
-- **No transaction costs or fees** for any agent.
-- **Refill-on-fill**: when an MM order is taken, a new order is immediately reposted
-  at the same price. This keeps the book two-sided but leaves a stale quote in place
-  until the next MM_OBSERVE fires 10ms later.
-- **Spread sampling**: avg spread is measured at each Y_JUMP (before anyone reacts).
-  One-sided book states (spread = None) are excluded. This means sniper-caused
-  one-sided periods don't inflate the average — a known measurement limitation.
-- **No mean reversion** in Y. Early versions used a dead-band reversion mechanism
-  but it caused artificial oscillation. Real intraday prices are non-stationary;
-  the BM component handles bounded drift naturally over an 8-hour window.
+Investor arrivals are an independent Poisson process with rate 1/sec. Inter-arrival
+times are drawn from an exponential distribution, accumulated until they exceed the
+trading day length. Direction (buy/sell) is drawn uniformly at random at arrival time.
 
 ---
 
@@ -97,10 +155,6 @@ cd ATS_Project
 uv sync
 ```
 
-`uv sync` reads `pyproject.toml` and `uv.lock` and creates `.venv` with pinned
-versions of all dependencies (`numpy`, `matplotlib`, `jupyter`, `pandas`).
-Commit `uv.lock` — it guarantees identical package versions across machines.
-
 ---
 
 ## Running
@@ -114,15 +168,15 @@ uv run jupyter notebook notebooks/phase1_processes.ipynb
 Reproduces a figure similar to Figure I in the BCS paper: the Y jump-diffusion
 process and lagged MM quotes shown at 4 time resolutions (full day → 250ms).
 
-### Phase 2 — Agent simulation
+### Phase 2 / 3 — Agent simulation
 
 ```bash
 uv run jupyter notebook notebooks/phase2_simulation.ipynb
 ```
 
 Runs the full discrete-event simulation with MM, snipers, and investors.
-Produces PnL and inventory charts comparing with-snipers vs without-snipers,
-a summary statistics table, and a spread distribution plot.
+Compares with-snipers vs without-snipers across PnL, inventory, spread, and
+MM alpha / spread adjustment over time.
 
 ### Quick sanity check
 
@@ -141,16 +195,17 @@ print(r.mm_pnl_history[-1])
 ```
 ATS_Project/
 ├── simulation/
-│   └── core.py                   # All simulation logic — both phases
+│   ├── core.py        # SimulationParams, Y process, OrderBook, SimulationRunner
+│   ├── agents.py      # MarketMaker, Sniper, Investor
+│   └── events.py      # Event dataclasses + EventLogger
 ├── notebooks/
 │   ├── phase1_processes.ipynb    # Y process at 4 time resolutions
-│   └── phase2_simulation.ipynb   # Agent simulation: with vs without snipers
+│   └── phase2_simulation.ipynb   # Agent simulation + Phase 3 analysis
 ├── src/
-│   ├── engine.py                 # Standalone continuous LOB (unused in sim)
-│   ├── auction.py                # Batch auction clearing (future Phase 3)
-│   └── ...                       # bench.py, cli.py, gen.py, metrics.py
-├── PROJECT_CONTEXT.md            # Full model documentation and findings
-├── pyproject.toml                # Dependencies managed by uv
-├── uv.lock                       # Pinned dependency versions (commit this)
-└── .venv/                        # Created by uv sync (not committed)
+│   ├── engine.py      # Standalone continuous LOB (unused in sim)
+│   ├── auction.py     # Batch auction clearing (future Phase 4)
+│   └── ...
+├── PROJECT_CONTEXT.md # Full parameter reference, findings, and next steps
+├── pyproject.toml
+└── uv.lock
 ```
