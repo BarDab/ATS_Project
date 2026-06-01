@@ -313,6 +313,7 @@ class Sniper:
         self._schedule_event = schedule_event
         self.realized_pnl: float = 0.0
         self.trades_executed: int = 0
+        self.trades_attempted: int = 0
 
     def snipe(self, y_value: float, observed_at_time: float):
         tick_size = self.params.tick_size
@@ -321,6 +322,7 @@ class Sniper:
 
         best_ask = self.book.get_best_ask()
         if best_ask is not None and (y_value - best_ask) > edge:
+            self.trades_attempted += 1
             if delay == 0.0 or self._schedule_event is None:
                 for f in self.book.submit_market(self.agent_id, "bid",
                                                  self.params.sniper_order_size,
@@ -346,6 +348,7 @@ class Sniper:
 
         best_bid = self.book.get_best_bid()
         if best_bid is not None and (best_bid - y_value) > edge:
+            self.trades_attempted += 1
             if delay == 0.0 or self._schedule_event is None:
                 for f in self.book.submit_market(self.agent_id, "ask",
                                                  self.params.sniper_order_size,

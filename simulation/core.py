@@ -50,6 +50,8 @@ class SimulationParams:
     mm_alpha_sensitivity: float = 2.0
     mm_spread_floor_ticks: int = 2
     mm_spread_ceiling_ticks: int = 20
+    # --- Event ordering ---
+    random_queue_ordering: bool = True
     # --- Logging ---
     enable_logging: bool = False
     log_dir: str = "logs"
@@ -230,8 +232,11 @@ class SimulationRunner:
     def _push_event(self, event: BaseEvent) -> None:
         if self._event_queue is None:
             return
-        event._seq = self._seq_counter
-        self._seq_counter += 1
+        if self.params.random_queue_ordering:
+            event._seq = int(self.rng.integers(0, 2**62))
+        else:
+            event._seq = self._seq_counter
+            self._seq_counter += 1
         heapq.heappush(self._event_queue, event)
 
     def _route_mm_fill(self, side: str, fill_price: float, fill_quantity: int,
@@ -271,15 +276,18 @@ class SimulationRunner:
                 break
             events.append(InvestorArriveEvent(time=t))
 
-        # Randomize order of simultaneous sniper events
-        events.sort(key=lambda e: (
-            e.time,
-            e.PRIORITY,
-            int(self.rng.integers(0, 2**31)) if isinstance(e, SniperObserveEvent) else 0,
-        ))
-
-        for i, e in enumerate(events):
-            e._seq = i
+        if self.params.random_queue_ordering:
+            events.sort(key=lambda e: (e.time, e.PRIORITY))
+            for e in events:
+                e._seq = int(self.rng.integers(0, 2**62))
+        else:
+            events.sort(key=lambda e: (
+                e.time,
+                e.PRIORITY,
+                int(self.rng.integers(0, 2**31)) if isinstance(e, SniperObserveEvent) else 0,
+            ))
+            for i, e in enumerate(events):
+                e._seq = i
         self._seq_counter = len(events)
         heapq.heapify(events) #sorts events, it guarantees earliest that event is first
         return events

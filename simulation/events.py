@@ -42,24 +42,24 @@ class SniperObserveEvent(BaseEvent):
 
 @dataclass
 class MMObserveEvent(BaseEvent):
-    PRIORITY: ClassVar[int] = 2
+    PRIORITY: ClassVar[int] = 1
     y_value: float = 0.0
 
 
 @dataclass
 class InvestorArriveEvent(BaseEvent):
-    PRIORITY: ClassVar[int] = 3
+    PRIORITY: ClassVar[int] = 1
 
 
 @dataclass
 class DeferredLabelEvent(BaseEvent):
-    PRIORITY: ClassVar[int] = 4
+    PRIORITY: ClassVar[int] = 1
     fill_id: str = ""
 
 
 @dataclass
 class DeferredLimitOrderEvent(BaseEvent):
-    PRIORITY: ClassVar[int] = 5
+    PRIORITY: ClassVar[int] = 1
     agent_id: str = ""
     side: str = ""
     price: float = 0.0
@@ -70,7 +70,7 @@ class DeferredLimitOrderEvent(BaseEvent):
 
 @dataclass
 class DeferredMarketOrderEvent(BaseEvent):
-    PRIORITY: ClassVar[int] = 5
+    PRIORITY: ClassVar[int] = 1
     agent_id: str = ""
     side: str = ""
     quantity: int = 0

@@ -70,6 +70,27 @@ DEFERRED_MARKET_ORDER → fires at decision_time + order_submission_delay; submi
 Cancellations are always immediate — they represent a risk management decision, not a
 new order travelling to the exchange.
 
+### Random queue ordering
+
+The parameter `random_queue_ordering` (default `True`) controls how events with
+identical timestamps are ordered. With `True`, same-timestamp events are randomised —
+modelling the real exchange behaviour where messages arriving in the same matching
+engine cycle are queued non-deterministically. The only exception is `YJumpEvent`
+(priority 0), which always fires before any agent action at the same timestamp.
+
+With `False`, the old deterministic priority order is used:
+`SniperObserveEvent → MMObserveEvent → InvestorArriveEvent → DeferredLabelEvent → DeferredLimitOrder/MarketOrder`.
+
+**The race condition** — when `order_submission_delay = mm_lag − sniper_lag = 9ms`,
+a sniper's deferred market order lands at exactly the same time as the MM's observe
+event (which cancels the stale quote inline). With random ordering, each of the N+1
+competing events (1 `MM_OBSERVE` + N sniper orders) is equally likely to fire first:
+
+```
+P(MM cancels before any sniper hits) = 1 / (N + 1)
+P(at least one sniper hits)          = N / (N + 1)
+```
+
 ---
 
 ## Agents
