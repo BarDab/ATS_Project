@@ -7,7 +7,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
     from .core import SimulationParams, SimulationResult
@@ -55,6 +55,26 @@ class InvestorArriveEvent(BaseEvent):
 class DeferredLabelEvent(BaseEvent):
     PRIORITY: ClassVar[int] = 4
     fill_id: str = ""
+
+
+@dataclass
+class DeferredLimitOrderEvent(BaseEvent):
+    PRIORITY: ClassVar[int] = 5
+    agent_id: str = ""
+    side: str = ""
+    price: float = 0.0
+    quantity: int = 0
+    register_id_callback: Any = field(default=None, repr=False)
+    cancelled: bool = field(default=False, repr=False)
+
+
+@dataclass
+class DeferredMarketOrderEvent(BaseEvent):
+    PRIORITY: ClassVar[int] = 5
+    agent_id: str = ""
+    side: str = ""
+    quantity: int = 0
+    post_fill_handler: Any = field(default=None, repr=False)
 
 
 _LOG_FIELDS = [

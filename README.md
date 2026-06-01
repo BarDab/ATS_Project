@@ -55,6 +55,21 @@ snapshot taken mid-jump. In a real market this corresponds to the time a dealer 
 to observe post-trade price impact before deciding whether the counterparty had
 private information.
 
+### Order submission delay
+
+The parameter `order_submission_delay` (default `0.0`) models the latency between an
+agent *deciding* to submit an order and that order *landing on the book* — exchange
+network latency. When set to a non-zero value, limit and market order submissions are
+not executed inline; instead two additional event types are pushed onto the heap:
+
+```
+DEFERRED_LIMIT_ORDER  → fires at decision_time + order_submission_delay; submits a limit order to the book
+DEFERRED_MARKET_ORDER → fires at decision_time + order_submission_delay; submits a market order and runs fill callbacks
+```
+
+Cancellations are always immediate — they represent a risk management decision, not a
+new order travelling to the exchange.
+
 ---
 
 ## Agents

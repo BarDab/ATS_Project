@@ -7,15 +7,18 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from .events import DeferredLimitOrderEvent, DeferredMarketOrderEvent
+
 if TYPE_CHECKING:
     from .core import SimulationParams, OrderBook
 
 
 class MarketMaker:
 
-    def __init__(self, params: SimulationParams, book: OrderBook):
+    def __init__(self, params: SimulationParams, book: OrderBook, schedule_event=None):
         self.params = params
         self.book = book
+        self._schedule_event = schedule_event
         self.inventory: float = 0.0
         self.realized_pnl: float = 0.0
         self.unrealized_pnl: float = 0.0
@@ -24,6 +27,8 @@ class MarketMaker:
         self.current_ask_id: str | None = None
         self._last_bid_price: float | None = None
         self._last_ask_price: float | None = None
+        self._pending_bid_event: DeferredLimitOrderEvent | None = None
+        self._pending_ask_event: DeferredLimitOrderEvent | None = None
         # informed trade tracking (Phase 3)
         self.fill_history: deque = deque(maxlen=params.mm_window_size)
         self.pending_fills: dict = {}
@@ -53,11 +58,17 @@ class MarketMaker:
         if self.current_bid_id:
             self.book.cancel_order(self.current_bid_id)
             self.current_bid_id = None
+        if self._pending_bid_event is not None:
+            self._pending_bid_event.cancelled = True
+            self._pending_bid_event = None
 
     def _cancel_ask(self):
         if self.current_ask_id:
             self.book.cancel_order(self.current_ask_id)
             self.current_ask_id = None
+        if self._pending_ask_event is not None:
+            self._pending_ask_event.cancelled = True
+            self._pending_ask_event = None
 
     def _cancel_both(self):
         self._cancel_bid()
@@ -68,14 +79,40 @@ class MarketMaker:
             return
         price = self._snap(mid - half)
         self._last_bid_price = price
-        self.current_bid_id = self.book.submit_limit("mm", "bid", price, 1, ts)
+        delay = self.params.order_submission_delay
+        if delay == 0.0 or self._schedule_event is None:
+            self.current_bid_id = self.book.submit_limit("mm", "bid", price, 1, ts)
+        else:
+            if self._pending_bid_event is not None:
+                self._pending_bid_event.cancelled = True
+            def _reg(oid):
+                self.current_bid_id = oid
+                self._pending_bid_event = None
+            ev = DeferredLimitOrderEvent(
+                time=ts + delay, agent_id="mm", side="bid",
+                price=price, quantity=1, register_id_callback=_reg)
+            self._pending_bid_event = ev
+            self._schedule_event(ev)
 
     def _post_ask(self, mid: float, half: float, ts: float):
         if self.inventory <= -self.params.mm_max_inventory:
             return
         price = self._snap(mid + half)
         self._last_ask_price = price
-        self.current_ask_id = self.book.submit_limit("mm", "ask", price, 1, ts)
+        delay = self.params.order_submission_delay
+        if delay == 0.0 or self._schedule_event is None:
+            self.current_ask_id = self.book.submit_limit("mm", "ask", price, 1, ts)
+        else:
+            if self._pending_ask_event is not None:
+                self._pending_ask_event.cancelled = True
+            def _reg(oid):
+                self.current_ask_id = oid
+                self._pending_ask_event = None
+            ev = DeferredLimitOrderEvent(
+                time=ts + delay, agent_id="mm", side="ask",
+                price=price, quantity=1, register_id_callback=_reg)
+            self._pending_ask_event = ev
+            self._schedule_event(ev)
 
     def react_to_divergence(self, y_value: float, observed_at_time: float,
                   current_book_mid: float | None):
@@ -152,15 +189,41 @@ class MarketMaker:
 
                     
     def _submit_new_order_after_fill(self, timestamp: float):
-        if self.params.mm_refill_on_fill:
-            if self.current_bid_id is None and self._last_bid_price is not None:
-                if self.inventory < self.params.mm_max_inventory:
+        if not self.params.mm_refill_on_fill:
+            return
+        delay = self.params.order_submission_delay
+        if self.current_bid_id is None and self._pending_bid_event is None \
+                and self._last_bid_price is not None:
+            if self.inventory < self.params.mm_max_inventory:
+                if delay == 0.0 or self._schedule_event is None:
                     self.current_bid_id = self.book.submit_limit(
                         "mm", "bid", self._last_bid_price, 1, timestamp)
-            if self.current_ask_id is None and self._last_ask_price is not None:
-                if self.inventory > -self.params.mm_max_inventory:
+                else:
+                    price = self._last_bid_price
+                    def _reg(oid):
+                        self.current_bid_id = oid
+                        self._pending_bid_event = None
+                    ev = DeferredLimitOrderEvent(
+                        time=timestamp + delay, agent_id="mm", side="bid",
+                        price=price, quantity=1, register_id_callback=_reg)
+                    self._pending_bid_event = ev
+                    self._schedule_event(ev)
+        if self.current_ask_id is None and self._pending_ask_event is None \
+                and self._last_ask_price is not None:
+            if self.inventory > -self.params.mm_max_inventory:
+                if delay == 0.0 or self._schedule_event is None:
                     self.current_ask_id = self.book.submit_limit(
                         "mm", "ask", self._last_ask_price, 1, timestamp)
+                else:
+                    price = self._last_ask_price
+                    def _reg(oid):
+                        self.current_ask_id = oid
+                        self._pending_ask_event = None
+                    ev = DeferredLimitOrderEvent(
+                        time=timestamp + delay, agent_id="mm", side="ask",
+                        price=price, quantity=1, register_id_callback=_reg)
+                    self._pending_ask_event = ev
+                    self._schedule_event(ev)
 
     def mark_to_market(self):
         """Just update unrealized PnL based on current mid price."""
@@ -242,39 +305,69 @@ class MarketMaker:
 class Sniper:
 
     def __init__(self, agent_id: str, params: SimulationParams,
-                 book: OrderBook, mm_fill_callback=None):
+                 book: OrderBook, mm_fill_callback=None, schedule_event=None):
         self.agent_id = agent_id
         self.params = params
         self.book = book
         self._mm_fill_cb = mm_fill_callback
+        self._schedule_event = schedule_event
         self.realized_pnl: float = 0.0
         self.trades_executed: int = 0
 
     def snipe(self, y_value: float, observed_at_time: float):
         tick_size = self.params.tick_size
         edge = self.params.sniper_min_edge_ticks * tick_size
+        delay = self.params.order_submission_delay
 
         best_ask = self.book.get_best_ask()
         if best_ask is not None and (y_value - best_ask) > edge:
-            for f in self.book.submit_market(self.agent_id, "bid",
-                                             self.params.sniper_order_size,
-                                             observed_at_time):
-                self.on_fill(f["price"], f["quantity"], "bid", y_value)
-                if self._mm_fill_cb and f["matched_agent_id"] == "mm":
-                    self._mm_fill_cb("ask", f["price"], f["quantity"],
-                                     observed_at_time, y_value,
-                                     f["matched_order_id"], self.agent_id)
+            if delay == 0.0 or self._schedule_event is None:
+                for f in self.book.submit_market(self.agent_id, "bid",
+                                                 self.params.sniper_order_size,
+                                                 observed_at_time):
+                    self.on_fill(f["price"], f["quantity"], "bid", y_value)
+                    if self._mm_fill_cb and f["matched_agent_id"] == "mm":
+                        self._mm_fill_cb("ask", f["price"], f["quantity"],
+                                         observed_at_time, y_value,
+                                         f["matched_order_id"], self.agent_id)
+            else:
+                y_snap = y_value
+                cb = self._mm_fill_cb; ref = self; a_id = self.agent_id
+                def _handler_bid(fills, fire_time, _y=y_snap, _cb=cb, _ref=ref, _aid=a_id):
+                    for f in fills:
+                        _ref.on_fill(f["price"], f["quantity"], "bid", _y)
+                        if _cb and f["matched_agent_id"] == "mm":
+                            _cb("ask", f["price"], f["quantity"],
+                                fire_time, _y, f["matched_order_id"], _aid)
+                self._schedule_event(DeferredMarketOrderEvent(
+                    time=observed_at_time + delay, agent_id=self.agent_id,
+                    side="bid", quantity=self.params.sniper_order_size,
+                    post_fill_handler=_handler_bid))
 
         best_bid = self.book.get_best_bid()
         if best_bid is not None and (best_bid - y_value) > edge:
-            for f in self.book.submit_market(self.agent_id, "ask",
-                                             self.params.sniper_order_size,
-                                             observed_at_time):
-                self.on_fill(f["price"], f["quantity"], "ask", y_value)
-                if self._mm_fill_cb and f["matched_agent_id"] == "mm":
-                    self._mm_fill_cb("bid", f["price"], f["quantity"],
-                                     observed_at_time, y_value,
-                                     f["matched_order_id"], self.agent_id)
+            if delay == 0.0 or self._schedule_event is None:
+                for f in self.book.submit_market(self.agent_id, "ask",
+                                                 self.params.sniper_order_size,
+                                                 observed_at_time):
+                    self.on_fill(f["price"], f["quantity"], "ask", y_value)
+                    if self._mm_fill_cb and f["matched_agent_id"] == "mm":
+                        self._mm_fill_cb("bid", f["price"], f["quantity"],
+                                         observed_at_time, y_value,
+                                         f["matched_order_id"], self.agent_id)
+            else:
+                y_snap = y_value
+                cb = self._mm_fill_cb; ref = self; a_id = self.agent_id
+                def _handler_ask(fills, fire_time, _y=y_snap, _cb=cb, _ref=ref, _aid=a_id):
+                    for f in fills:
+                        _ref.on_fill(f["price"], f["quantity"], "ask", _y)
+                        if _cb and f["matched_agent_id"] == "mm":
+                            _cb("bid", f["price"], f["quantity"],
+                                fire_time, _y, f["matched_order_id"], _aid)
+                self._schedule_event(DeferredMarketOrderEvent(
+                    time=observed_at_time + delay, agent_id=self.agent_id,
+                    side="ask", quantity=self.params.sniper_order_size,
+                    post_fill_handler=_handler_ask))
 
     def on_fill(self, fill_price: float, fill_quantity: int,
                 side: str, current_Y: float):
@@ -289,21 +382,38 @@ class Sniper:
 class Investor:
 
     def __init__(self, params: SimulationParams, book: OrderBook,
-                 rng: np.random.Generator, mm_fill_callback=None):
+                 rng: np.random.Generator, mm_fill_callback=None, schedule_event=None):
         self.params = params
         self.book = book
         self.rng = rng
         self._mm_fill_cb = mm_fill_callback
+        self._schedule_event = schedule_event
         self.trades_executed: int = 0
 
     def arrive(self, timestamp: float):
         side = self.rng.choice(["bid", "ask"])
-        fills = self.book.submit_market("inv", side,
-                                        self.params.investor_order_size, timestamp)
-        if fills:
-            self.trades_executed += 1
-        for f in fills:
-            if self._mm_fill_cb and f["matched_agent_id"] == "mm":
-                mm_side = "ask" if side == "bid" else "bid"
-                self._mm_fill_cb(mm_side, f["price"], f["quantity"], timestamp,
-                                 None, f["matched_order_id"], "inv")
+        delay = self.params.order_submission_delay
+        if delay == 0.0 or self._schedule_event is None:
+            fills = self.book.submit_market("inv", side,
+                                            self.params.investor_order_size, timestamp)
+            if fills:
+                self.trades_executed += 1
+            for f in fills:
+                if self._mm_fill_cb and f["matched_agent_id"] == "mm":
+                    mm_side = "ask" if side == "bid" else "bid"
+                    self._mm_fill_cb(mm_side, f["price"], f["quantity"], timestamp,
+                                     None, f["matched_order_id"], "inv")
+        else:
+            mm_side = "ask" if side == "bid" else "bid"
+            cb = self._mm_fill_cb; ref = self
+            def _handler(fills, fire_time, _mm_side=mm_side, _cb=cb, _ref=ref):
+                if fills:
+                    _ref.trades_executed += 1
+                for f in fills:
+                    if _cb and f["matched_agent_id"] == "mm":
+                        _cb(_mm_side, f["price"], f["quantity"], fire_time,
+                            None, f["matched_order_id"], "inv")
+            self._schedule_event(DeferredMarketOrderEvent(
+                time=timestamp + delay, agent_id="inv", side=side,
+                quantity=self.params.investor_order_size,
+                post_fill_handler=_handler))

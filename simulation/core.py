@@ -10,6 +10,7 @@ from .events import (
     EventLogger,
     BaseEvent, YJumpEvent, SniperObserveEvent, MMObserveEvent,
     InvestorArriveEvent, DeferredLabelEvent,
+    DeferredLimitOrderEvent, DeferredMarketOrderEvent,
 )
 from .agents import MarketMaker, Sniper, Investor
 
@@ -34,6 +35,7 @@ class SimulationParams:
     mm_refill_on_fill: bool = True
     # --- Snipers ---
     sniper_lag: float = 0.001
+    order_submission_delay: float = 0.02
     sniper_order_size: int = 1
     n_snipers: int = 2
     sniper_min_edge_ticks: int = 2 # this is currently used for both labeling and sniper logic, just to keep it simple, but can be separated if needed
@@ -192,15 +194,17 @@ class SimulationRunner:
         self.rng = np.random.default_rng(params.seed + 1000)
         self.book = OrderBook()
         self.logger = EventLogger(params)
-        self.mm = MarketMaker(params, self.book)
+        self.mm = MarketMaker(params, self.book, schedule_event=self._push_event)
         self.snipers: list[Sniper] = [
             Sniper(f"snip{i + 1}", params, self.book,
-                   mm_fill_callback=self._route_mm_fill)
+                   mm_fill_callback=self._route_mm_fill,
+                   schedule_event=self._push_event)
             for i in range(params.n_snipers)
         ]
         inv_rng = np.random.default_rng(self.rng.integers(0, 2**31))
         self.investor = Investor(params, self.book, inv_rng,
-                                 mm_fill_callback=self._route_mm_fill)
+                                 mm_fill_callback=self._route_mm_fill,
+                                 schedule_event=self._push_event)
         self._current_Y: float = params.Y0
         self._sniper_map: dict[str, Sniper] = {s.agent_id: s for s in self.snipers}
         self._event_queue: list | None = None
@@ -223,6 +227,13 @@ class SimulationRunner:
             "adverse_selection_loss": self.mm.adverse_selection_loss,
         }
 
+    def _push_event(self, event: BaseEvent) -> None:
+        if self._event_queue is None:
+            return
+        event._seq = self._seq_counter
+        self._seq_counter += 1
+        heapq.heappush(self._event_queue, event)
+
     def _route_mm_fill(self, side: str, fill_price: float, fill_quantity: int,
                        timestamp: float, current_Y: float | None,
                        fill_id: str | None = None, taker_agent_id: str | None = None):
@@ -233,13 +244,10 @@ class SimulationRunner:
                               taker_agent_id=taker_agent_id,
                               Y_value=self._current_Y,
                               **self._mm_state())
-        if fill_id is not None and self._event_queue is not None:
+        if fill_id is not None:
             label_time = timestamp + self.params.mm_detection_window
             if label_time <= self.params.T:
-                seq = self._seq_counter
-                self._seq_counter += 1
-                heapq.heappush(self._event_queue,
-                               DeferredLabelEvent(time=label_time, fill_id=fill_id, _seq=seq))
+                self._push_event(DeferredLabelEvent(time=label_time, fill_id=fill_id))
 
     def build_event_queue(self, y_times: np.ndarray,
                           y_prices: np.ndarray) -> list[BaseEvent]:
@@ -323,6 +331,15 @@ class SimulationRunner:
                                               Y_value=self._current_Y,
                                               informed=informed,
                                               **self._mm_state())
+                case DeferredLimitOrderEvent(agent_id=aid, side=s, price=p, quantity=q):
+                    if not event.cancelled:
+                        oid = self.book.submit_limit(aid, s, p, q, event.time)
+                        if event.register_id_callback is not None:
+                            event.register_id_callback(oid)
+                case DeferredMarketOrderEvent(agent_id=aid, side=s, quantity=q):
+                    fills = self.book.submit_market(aid, s, q, event.time)
+                    if event.post_fill_handler is not None:
+                        event.post_fill_handler(fills, event.time)
 
         result = SimulationResult(
             mm_pnl_history=mm_pnl_history,
