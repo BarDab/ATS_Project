@@ -30,7 +30,7 @@ class MarketMaker:
         self._pending_bid_event: DeferredLimitOrderEvent | None = None
         self._pending_ask_event: DeferredLimitOrderEvent | None = None
         # informed trade tracking (Phase 3)
-        self.fill_history: deque = deque(maxlen=params.mm_window_size)
+        self.fill_history: deque = deque(maxlen=params.mm_window_size) #deque when adding new fill and queue is full, we remove oldest and. Acts as rolling window
         self.pending_fills: dict = {}
         self.alpha: float = 0.0
         self.current_spread_ticks: float = params.mm_base_spread_ticks
@@ -117,7 +117,6 @@ class MarketMaker:
     def react_to_divergence(self, y_value: float, observed_at_time: float,
                   current_book_mid: float | None):
         ts = self.params.tick_size
-        skewed_mid = y_value - self.inventory * self.params.mm_inventory_skew_factor * ts
         normal_half = self.current_spread_ticks * ts / 2
         wide_half = (self.current_spread_ticks * 2) * ts / 2
         div = (abs(current_book_mid - y_value) / ts
@@ -125,13 +124,13 @@ class MarketMaker:
 
         if div > self.params.mm_divergence_threshold_ticks:
             self._cancel_both()
-            self._post_bid(skewed_mid, wide_half, observed_at_time)
-            self._post_ask(skewed_mid, wide_half, observed_at_time)
+            self._post_bid(y_value, wide_half, observed_at_time)
+            self._post_ask(y_value, wide_half, observed_at_time)
 
         else:
             self._cancel_both()
-            self._post_bid(skewed_mid, normal_half, observed_at_time)
-            self._post_ask(skewed_mid, normal_half, observed_at_time)
+            self._post_bid(y_value, normal_half, observed_at_time)
+            self._post_ask(y_value, normal_half, observed_at_time)
 
     def on_fill(self, fill_id: str | None, side: str, fill_price: float,
                 fill_quantity: int, timestamp: float):

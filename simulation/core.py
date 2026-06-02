@@ -20,13 +20,13 @@ class SimulationParams:
     # --- Price process ---
     Y0: float = 100.0
     tick_size: float = 0.01
-    target_jumps_per_day = 100000          # class var
-    jump_size_probs = [0.7, 0.2, 0.07, 0.03]   # class var
+    target_jumps_per_day = 100000
+    jump_size_probs = [0.7, 0.2, 0.07, 0.03]   # discrete probabilityies for jumps
     trading_hours: float = 8.0
     seed: int = 42
-    sigma: float = 0.05
+    sigma: float = 0.05 # volatility for process of price generation
     # --- Phase 1 quote tracking ---
-    mm_lag: float = 0.010
+    mm_lag: float = 0.010  # lag in observing prices by MM, should be named differently
     # --- Market Maker (Phase 2) ---
     mm_base_spread_ticks: int = 4
     mm_max_inventory: float = 100.0
@@ -34,8 +34,8 @@ class SimulationParams:
     mm_divergence_threshold_ticks: int = 2
     mm_refill_on_fill: bool = True
     # --- Snipers ---
-    sniper_lag: float = 0.001
-    order_submission_delay: float = 0.02
+    sniper_lag: float = 0.001 # sniper lag in observation
+    order_submission_delay: float = 0.02 # global delay for all orders except cancels
     sniper_order_size: int = 1
     n_snipers: int = 2
     sniper_min_edge_ticks: int = 2 # this is currently used for both labeling and sniper logic, just to keep it simple, but can be separated if needed
@@ -43,15 +43,15 @@ class SimulationParams:
     investor_arrival_rate: float = 1.0
     investor_order_size: int = 1
     # --- Informed Trade Detection (Phase 3) ---
-    mm_detection_window: float = 0.1
-    mm_window_size: int = 50
+    mm_detection_window: float = 0.1 # time after which MM can evaulate if given trade was informed or not
+    mm_window_size: int = 50 # number of recent fills MM uses to estimate alpha and adjust spread, should be large enough to have stable estimation but small enough to adapt
     mm_min_fills_for_adjustment: int = 10 # before adjusting alpha for calculating MM spread, we need minimal fills to have somewhat stable estimation
     # --- Spread Adjustment (Phase 3) ---
-    mm_alpha_sensitivity: float = 2.0
+    mm_alpha_sensitivity: float = 2.0 #how much alpha affects spread adjustment
     mm_spread_floor_ticks: int = 2
     mm_spread_ceiling_ticks: int = 20
     # --- Event ordering ---
-    random_queue_ordering: bool = True
+    random_queue_ordering: bool = True # when orders arrive at the same time, we randomize their order in the queue
     # --- Logging ---
     enable_logging: bool = False
     log_dir: str = "logs"
